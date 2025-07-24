@@ -68,8 +68,8 @@ def create_optimized_prompt(message: str) -> str:
         return f"""<|system|>당신은 도움이 되는 AI 어시스턴트입니다. 프로그래밍과 기술 문제에 대해 정확하고 구체적인 답변을 제공합니다.</s>
 <|user|>{message}</s>
 <|assistant|>"""
-    elif any(keyword in message.lower() for keyword in ['설명', '알려줘', '무엇', '어떻게']):
-        return f"""<|system|>당신은 지식이 풍부한 AI 어시스턴트입니다. 질문에 대해 정확하고 이해하기 쉬운 설명을 제공합니다.</s>
+    elif any(keyword in message.lower() for keyword in ['설명', '알려줘', '무엇', '어떻게', '순위', '정보']):
+        return f"""<|system|>당신은 지식이 풍부한 AI 어시스턴트입니다. 질문에 대해 정확하고 자세한 설명을 제공합니다. 충분한 정보를 포함하여 답변해주세요.</s>
 <|user|>{message}</s>
 <|assistant|>"""
     else:
@@ -78,30 +78,45 @@ def create_optimized_prompt(message: str) -> str:
 <|assistant|>"""
 
 
-def is_response_complete(text: str) -> bool:
-    """응답이 완료되었는지 확인"""
-    # 문장 종료 패턴 검사
+def is_response_complete(text: str, token_count: int) -> bool:
+    """응답이 완료되었는지 확인 - 더 관대한 조건으로 변경"""
+    # 최소 토큰 수 확인 (너무 짧은 답변 방지)
+    if token_count < 30:  # 최소 30토큰은 생성하도록
+        return False
+
+    # 텍스트 길이도 확인 (한국어 특성상)
+    if len(text.strip()) < 50:  # 최소 50자는 생성하도록
+        return False
+
+    # 완전한 문장으로 끝나는지 확인 (더 엄격한 패턴)
     complete_patterns = [
-        r'[.!?]$',  # 문장 부호로 끝남
-        r'입니다\.$',  # 정중한 종료
-        r'습니다\.$',  # 정중한 종료
-        r'됩니다\.$',  # 정중한 종료
-        r'있습니다\.$',  # 정중한 종료
+        r'.+[.!?]\s*$',  # 내용이 있고 문장부호로 끝남
+        r'.+입니다\.$',  # 내용이 있고 "입니다."로 끝남
+        r'.+습니다\.$',  # 내용이 있고 "습니다."로 끝남
+        r'.+됩니다\.$',  # 내용이 있고 "됩니다."로 끝남
+        r'.+있습니다\.$',  # 내용이 있고 "있습니다."로 끝남
+        r'.+합니다\.$',  # 내용이 있고 "합니다."로 끝남
     ]
 
-    return any(re.search(pattern, text.strip()) for pattern in complete_patterns)
+    # 여러 문장이 포함되어 있고 마지막이 완전한 종료인지 확인
+    sentences = re.split(r'[.!?]', text.strip())
+    if len(sentences) >= 2:  # 최소 2개 문장이 있을 때만 종료 고려
+        return any(re.search(pattern, text.strip()) for pattern in complete_patterns)
+
+    return False
 
 
 def should_stop_generation(accumulated_text: str, current_token: str, token_count: int) -> bool:
-    """생성을 중단해야 하는지 판단"""
-    # 반복 패턴 감지
-    if token_count > 20:
+    """생성을 중단해야 하는지 판단 - 더 관대하게 수정"""
+    # 반복 패턴 감지 (더 엄격하게)
+    if token_count > 50:  # 50토큰 이후에만 반복 검사
         words = accumulated_text.split()
-        if len(words) >= 10:
-            # 최근 5개 단어가 반복되는지 확인
-            recent_words = words[-5:]
-            previous_words = words[-10:-5] if len(words) >= 10 else []
-            if recent_words == previous_words and len(set(recent_words)) > 1:
+        if len(words) >= 15:  # 15개 단어 이상일 때만 검사
+            # 최근 7개 단어가 반복되는지 확인 (더 긴 패턴)
+            recent_words = words[-7:]
+            previous_words = words[-14:-7] if len(words) >= 14 else []
+            if recent_words == previous_words and len(set(recent_words)) > 2:
+                logger.info(f"반복 패턴 감지: {recent_words}")
                 return True
 
     # 부적절한 패턴 감지
@@ -114,11 +129,14 @@ def should_stop_generation(accumulated_text: str, current_token: str, token_coun
         "Human:",
         "AI:",
         "\n\n질문",
-        "\n\n답변"
+        "\n\n답변",
+        "사용자:",
+        "\n사용자:"
     ]
 
     for pattern in unwanted_patterns:
-        if pattern in current_token or pattern in accumulated_text[-50:]:
+        if pattern in current_token or pattern in accumulated_text[-100:]:  # 마지막 100자에서 검사
+            logger.info(f"부적절한 패턴 감지: {pattern}")
             return True
 
     return False
@@ -158,19 +176,17 @@ async def chat_endpoint(request: Request):
                     presence_penalty=0.1,  # 존재 페널티
                     echo=False,
                     stream=True,
-                    stop=["</s>", "<|user|>", "<|system|>", "Human:", "질문:", "\n질문:", "\n\n"]
+                    stop=["</s>", "<|user|>", "<|system|>", "Human:", "\n질문:", "\n\n"]  # 일부 stop 조건 완화
                 )
 
                 token_count = 0
                 accumulated_text = ""
-                sentence_buffer = ""
 
                 for chunk in response:
                     if 'choices' in chunk and len(chunk['choices']) > 0:
                         text = chunk['choices'][0].get('text', '')
                         if text:
                             accumulated_text += text
-                            sentence_buffer += text
 
                             # 중단 조건 검사
                             if should_stop_generation(accumulated_text, text, token_count):
@@ -180,16 +196,15 @@ async def chat_endpoint(request: Request):
                             token_count += 1
 
                             # 디버깅 로그 레벨 조정
-                            if token_count % 10 == 0:  # 10토큰마다 로깅
-                                logger.info(f"토큰 #{token_count}: 생성 진행 중...")
+                            if token_count % 20 == 0:  # 20토큰마다 로깅
+                                logger.info(f"토큰 #{token_count}: 생성 진행 중... (길이: {len(accumulated_text)})")
 
                             yield f"data: {json.dumps({'text': text}, ensure_ascii=False)}\n\n"
 
-                            # 문장 단위로 완료 체크
-                            if text in '.!?' and is_response_complete(accumulated_text):
-                                if token_count > 10:  # 최소 토큰 수 확인
-                                    logger.info("문장 완료 감지, 생성 종료")
-                                    break
+                            # 문장 단위로 완료 체크 - 더 관대한 조건
+                            if text in '.!?' and is_response_complete(accumulated_text, token_count):
+                                logger.info(f"문장 완료 감지, 생성 종료 (토큰: {token_count}, 길이: {len(accumulated_text)})")
+                                break
 
                             # 최대 토큰 수 제한
                             if token_count > 1500:
@@ -517,4 +532,4 @@ async def get_chat_interface():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="localhost", port=8000)
+    uvicorn.run(app, host="192.168.0.13", port=8000)
