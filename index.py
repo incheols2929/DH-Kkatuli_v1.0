@@ -39,7 +39,7 @@ def initialize_model():
                 #model_path="models/EEVE-Korean-Instruct-10.8B-v1.0-Q8_0.gguf",
                 # model_path="models/Gugugo-koen-7B-V1.1.Q8_0.gguf",
                 # model_path="models/KONI-Llama3-8B-20240630.Q4_0.gguf",
-                model_path="models/llama-3.2-Korean-Bllossom-3B-Q4_K_M.gguf",
+                model_path="model/llama-3.2-Korean-Bllossom-3B-Q4_K_M.gguf",
                 n_ctx=2048,
                 n_threads=8,  # CPU 코어 수에 맞게 증가 (4-16 사이 권장)
                 n_threads_batch=8,  # 배치 처리용 스레드도 추가
