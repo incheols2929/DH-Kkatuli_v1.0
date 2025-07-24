@@ -62,33 +62,33 @@ def initialize_model():
 
 
 def create_optimized_prompt(message: str) -> str:
-    """최적화된 프롬프트 생성"""
-    # 메시지 타입에 따른 프롬프트 선택
+    """최적화된 프롬프트 생성 - 더 자세한 답변 유도"""
     if any(keyword in message.lower() for keyword in ['코드', 'code', '프로그래밍', '파이썬', '자바']):
-        return f"""<|system|>당신은 도움이 되는 AI 어시스턴트입니다. 프로그래밍과 기술 문제에 대해 정확하고 구체적인 답변을 제공합니다.</s>
+        return f"""<|system|>당신은 도움이 되는 AI 어시스턴트입니다. 프로그래밍과 기술 문제에 대해 정확하고 구체적인 답변을 제공합니다. 가능한 한 자세하고 완전한 설명을 해주세요.</s>
 <|user|>{message}</s>
 <|assistant|>"""
     elif any(keyword in message.lower() for keyword in ['설명', '알려줘', '무엇', '어떻게', '순위', '정보']):
-        return f"""<|system|>당신은 지식이 풍부한 AI 어시스턴트입니다. 질문에 대해 정확하고 자세한 설명을 제공합니다. 충분한 정보를 포함하여 답변해주세요.</s>
+        return f"""<|system|>당신은 지식이 풍부한 AI 어시스턴트입니다. 질문에 대해 정확하고 자세한 설명을 제공합니다. 충분한 정보와 배경 지식을 포함하여 완전한 답변을 해주세요. 짧은 답변보다는 상세하고 유용한 정보를 제공하는 것이 중요합니다.</s>
 <|user|>{message}</s>
 <|assistant|>"""
     else:
-        return f"""<|system|>당신은 친근하고 도움이 되는 AI 어시스턴트입니다. 사용자의 질문에 성의껏 답변해주세요.</s>
+        return f"""<|system|>당신은 친근하고 도움이 되는 AI 어시스턴트입니다. 사용자의 질문에 성의껏 답변해주세요. 가능한 한 자세하고 완전한 답변을 제공하여 사용자가 만족할 수 있도록 도와주세요.</s>
 <|user|>{message}</s>
 <|assistant|>"""
 
 
+
 def is_response_complete(text: str, token_count: int) -> bool:
-    """응답이 완료되었는지 확인 - 더 관대한 조건으로 변경"""
-    # 최소 토큰 수 확인 (너무 짧은 답변 방지)
-    if token_count < 30:  # 최소 30토큰은 생성하도록
+    """응답이 완료되었는지 확인 - 더 엄격한 조건으로 변경"""
+    # 최소 토큰 수 확인 (더 많은 토큰 요구)
+    if token_count < 100:  # 최소 100토큰은 생성하도록 증가
         return False
 
     # 텍스트 길이도 확인 (한국어 특성상)
-    if len(text.strip()) < 50:  # 최소 50자는 생성하도록
+    if len(text.strip()) < 200:  # 최소 200자는 생성하도록 증가
         return False
 
-    # 완전한 문장으로 끝나는지 확인 (더 엄격한 패턴)
+    # 완전한 문장으로 끝나는지 확인
     complete_patterns = [
         r'.+[.!?]\s*$',  # 내용이 있고 문장부호로 끝남
         r'.+입니다\.$',  # 내용이 있고 "입니다."로 끝남
@@ -98,12 +98,14 @@ def is_response_complete(text: str, token_count: int) -> bool:
         r'.+합니다\.$',  # 내용이 있고 "합니다."로 끝남
     ]
 
-    # 여러 문장이 포함되어 있고 마지막이 완전한 종료인지 확인
+    # 충분한 내용과 문장이 포함되어 있는지 확인
     sentences = re.split(r'[.!?]', text.strip())
-    if len(sentences) >= 2:  # 최소 2개 문장이 있을 때만 종료 고려
+    if len(sentences) >= 3:  # 최소 3개 문장이 있을 때만 종료 고려
+        # 마지막 문장이 완전한 종료 패턴인지 확인
         return any(re.search(pattern, text.strip()) for pattern in complete_patterns)
 
     return False
+
 
 
 def should_stop_generation(accumulated_text: str, current_token: str, token_count: int) -> bool:
@@ -167,16 +169,16 @@ async def chat_endpoint(request: Request):
 
                 response = llm(
                     prompt,
-                    max_tokens=2048,  # 토큰 수 증가
-                    temperature=0.7,  # 적절한 창의성
-                    top_p=0.9,  # 토큰 선택 범위
-                    top_k=40,  # 상위 K개 토큰만 고려
-                    repeat_penalty=1.15,  # 반복 페널티
-                    frequency_penalty=0.2,  # 빈도 페널티
-                    presence_penalty=0.1,  # 존재 페널티
+                    max_tokens=3072,  # 토큰 수 더 증가
+                    temperature=0.8,  # 창의성 약간 증가
+                    top_p=0.95,  # 토큰 선택 범위 확대
+                    top_k=50,  # 상위 K개 토큰 확대
+                    repeat_penalty=1.1,  # 반복 페널티 완화
+                    frequency_penalty=0.1,  # 빈도 페널티 완화
+                    presence_penalty=0.05,  # 존재 페널티 완화
                     echo=False,
                     stream=True,
-                    stop=["</s>", "<|user|>", "<|system|>", "Human:", "\n질문:", "\n\n"]  # 일부 stop 조건 완화
+                    stop=["</s>", "<|user|>", "<|system|>"]  # stop 조건 최소화
                 )
 
                 token_count = 0
