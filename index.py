@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import psutil
+import re
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -36,23 +37,23 @@ def initialize_model():
         try:
             logger.info("모델 로딩 시작...")
             llm = Llama(
-                #model_path="models/EEVE-Korean-Instruct-10.8B-v1.0-Q8_0.gguf",
-                # model_path="models/Gugugo-koen-7B-V1.1.Q8_0.gguf",
-                # model_path="models/KONI-Llama3-8B-20240630.Q4_0.gguf",
-                model_path="model/llama-3.2-Korean-Bllossom-3B-Q4_K_M.gguf",
-                n_ctx=2048,
-                n_threads=8,  # CPU 코어 수에 맞게 증가 (4-16 사이 권장)
-                n_threads_batch=8,  # 배치 처리용 스레드도 추가
+                model_path="model/EEVE-Korean-Instruct-10.8B-v1.0-Q8_0.gguf",
+                # model_path="model/Gugugo-koen-7B-V1.1.Q8_0.gguf",
+                # model_path="model/KONI-Llama3-8B-20240630.Q4_0.gguf",
+                # model_path="model/llama-3.2-Korean-Bllossom-3B-Q4_K_M.gguf",
+                n_ctx=4096,  # 컨텍스트 길이 증가
+                n_threads=8,
+                n_threads_batch=8,
                 n_gpu_layers=0,
                 verbose=False,
-                n_batch=512,  # 배치 크기 증가
+                n_batch=1024,  # 배치 크기 증가
                 use_mlock=False,
                 use_mmap=True,
-                # GPU 설정
-                main_gpu=0,  # 주 GPU 설정
-                # 성능 최적화 옵션들
-                numa=False,  # NUMA 비활성화 (단일 소켓 시스템에서)
-
+                main_gpu=0,
+                numa=False,
+                # 추가 성능 최적화 옵션
+                seed=-1,  # 랜덤 시드
+                flash_attn=True,  # Flash Attention 활성화 (지원되는 경우)
             )
             logger.info("모델 로딩 완료")
         except Exception as e:
@@ -60,9 +61,67 @@ def initialize_model():
             raise e
 
 
-def create_simple_prompt(message: str) -> str:
-    """간단한 프롬프트 생성"""
-    return f"다음 질문에 한국어로 간결하고 정확하게 한 번만 답변해주세요.\n\n질문: {message}\n\n답변:"
+def create_optimized_prompt(message: str) -> str:
+    """최적화된 프롬프트 생성"""
+    # 메시지 타입에 따른 프롬프트 선택
+    if any(keyword in message.lower() for keyword in ['코드', 'code', '프로그래밍', '파이썬', '자바']):
+        return f"""<|system|>당신은 도움이 되는 AI 어시스턴트입니다. 프로그래밍과 기술 문제에 대해 정확하고 구체적인 답변을 제공합니다.</s>
+<|user|>{message}</s>
+<|assistant|>"""
+    elif any(keyword in message.lower() for keyword in ['설명', '알려줘', '무엇', '어떻게']):
+        return f"""<|system|>당신은 지식이 풍부한 AI 어시스턴트입니다. 질문에 대해 정확하고 이해하기 쉬운 설명을 제공합니다.</s>
+<|user|>{message}</s>
+<|assistant|>"""
+    else:
+        return f"""<|system|>당신은 친근하고 도움이 되는 AI 어시스턴트입니다. 사용자의 질문에 성의껏 답변해주세요.</s>
+<|user|>{message}</s>
+<|assistant|>"""
+
+
+def is_response_complete(text: str) -> bool:
+    """응답이 완료되었는지 확인"""
+    # 문장 종료 패턴 검사
+    complete_patterns = [
+        r'[.!?]$',  # 문장 부호로 끝남
+        r'입니다\.$',  # 정중한 종료
+        r'습니다\.$',  # 정중한 종료
+        r'됩니다\.$',  # 정중한 종료
+        r'있습니다\.$',  # 정중한 종료
+    ]
+
+    return any(re.search(pattern, text.strip()) for pattern in complete_patterns)
+
+
+def should_stop_generation(accumulated_text: str, current_token: str, token_count: int) -> bool:
+    """생성을 중단해야 하는지 판단"""
+    # 반복 패턴 감지
+    if token_count > 20:
+        words = accumulated_text.split()
+        if len(words) >= 10:
+            # 최근 5개 단어가 반복되는지 확인
+            recent_words = words[-5:]
+            previous_words = words[-10:-5] if len(words) >= 10 else []
+            if recent_words == previous_words and len(set(recent_words)) > 1:
+                return True
+
+    # 부적절한 패턴 감지
+    unwanted_patterns = [
+        "질문:",
+        "답변:",
+        "<|user|>",
+        "<|assistant|>",
+        "<|system|>",
+        "Human:",
+        "AI:",
+        "\n\n질문",
+        "\n\n답변"
+    ]
+
+    for pattern in unwanted_patterns:
+        if pattern in current_token or pattern in accumulated_text[-50:]:
+            return True
+
+    return False
 
 
 @app.post("/chat")
@@ -81,59 +140,64 @@ async def chat_endpoint(request: Request):
 
         logger.info(f"사용자 메시지: {user_message}")
 
-        # 간단한 프롬프트 사용
-        prompt = create_simple_prompt(user_message)
+        # 최적화된 프롬프트 사용
+        prompt = create_optimized_prompt(user_message)
 
         def generate():
             try:
-                logger.info(f"프롬프트: {prompt}")  # 디버깅용
+                logger.info(f"프롬프트: {prompt[:100]}...")  # 프롬프트 일부만 로깅
 
                 response = llm(
                     prompt,
-                    max_tokens=1024,  # 토큰 수 줄여서 반복 방지
-                    temperature=0.3,  # 더 낮은 온도로 일관성 증가
-                    top_p=0.8,  # 더 보수적 선택
-                    repeat_penalty=1.3,  # 반복 페널티 강화
-                    frequency_penalty=0.5,  # 빈도 페널티 추가
-                    presence_penalty=0.3,  # 존재 페널티 추가
+                    max_tokens=2048,  # 토큰 수 증가
+                    temperature=0.7,  # 적절한 창의성
+                    top_p=0.9,  # 토큰 선택 범위
+                    top_k=40,  # 상위 K개 토큰만 고려
+                    repeat_penalty=1.15,  # 반복 페널티
+                    frequency_penalty=0.2,  # 빈도 페널티
+                    presence_penalty=0.1,  # 존재 페널티
                     echo=False,
                     stream=True,
-                    stop=["\n질문:", "질문:", "\n답변:", "답변:", "\n\n", "Human:", "Assistant:", "사용자:", "\n사용자:"]  # 정지 조건 강화
+                    stop=["</s>", "<|user|>", "<|system|>", "Human:", "질문:", "\n질문:", "\n\n"]
                 )
 
                 token_count = 0
                 accumulated_text = ""
+                sentence_buffer = ""
 
                 for chunk in response:
                     if 'choices' in chunk and len(chunk['choices']) > 0:
                         text = chunk['choices'][0].get('text', '')
                         if text:
-                            # 반복되는 패턴 감지 및 중단
                             accumulated_text += text
+                            sentence_buffer += text
 
-                            # 같은 문장이 반복되는지 확인
-                            sentences = accumulated_text.split('.')  
-                            if len(sentences) >= 3:
-                                last_three = sentences[-3:]
-                                if len(set(last_three)) == 1 and last_three[0].strip():  # 같은 문장 반복
-                                    logger.info("반복되는 문장 감지, 생성 중단")
-                                    break
-
-                            # 질문 형태가 나타나면 중단 (모델이 새로운 질문을 생성하기 시작할 때)
-                            if any(marker in text for marker in ["질문:", "Q:", "?"]) and token_count > 10:
-                                logger.info("질문 패턴 감지, 생성 중단")
+                            # 중단 조건 검사
+                            if should_stop_generation(accumulated_text, text, token_count):
+                                logger.info("부적절한 패턴 감지, 생성 중단")
                                 break
 
                             token_count += 1
-                            logger.info(f"토큰 #{token_count}: {repr(text)}")  # 디버깅용
+
+                            # 디버깅 로그 레벨 조정
+                            if token_count % 10 == 0:  # 10토큰마다 로깅
+                                logger.info(f"토큰 #{token_count}: 생성 진행 중...")
+
                             yield f"data: {json.dumps({'text': text}, ensure_ascii=False)}\n\n"
 
-                            # 너무 많은 토큰 생성 방지
-                            if token_count > 800:
+                            # 문장 단위로 완료 체크
+                            if text in '.!?' and is_response_complete(accumulated_text):
+                                if token_count > 10:  # 최소 토큰 수 확인
+                                    logger.info("문장 완료 감지, 생성 종료")
+                                    break
+
+                            # 최대 토큰 수 제한
+                            if token_count > 1500:
                                 logger.info("최대 토큰 수 도달, 생성 중단")
                                 break
 
                 logger.info(f"총 생성된 토큰 수: {token_count}")
+                logger.info(f"생성된 텍스트 길이: {len(accumulated_text)}")
                 yield "data: [DONE]\n\n"
 
             except Exception as e:
@@ -154,55 +218,71 @@ async def get_chat_interface():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>DH-Kkatuli_v1.0</title>
+        <title>DH-Kkatuli_v1.0 (Enhanced)</title>
         <meta charset="UTF-8">
         <style>
             #chat-container { 
-                max-width: 800px; 
+                max-width: 900px; 
                 margin: 20px auto; 
                 padding: 20px;
                 font-family: 'Malgun Gothic', Arial, sans-serif;
             }
             #messages { 
                 margin-bottom: 20px;
-                padding: 10px;
-                height: 400px;
+                padding: 15px;
+                height: 500px;
                 overflow-y: auto;
-                border: 1px solid #ccc;
-                border-radius: 5px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                background-color: #fafafa;
             }
             .message { 
-                margin: 10px 0;
-                padding: 10px;
-                border-radius: 5px;
+                margin: 15px 0;
+                padding: 12px 15px;
+                border-radius: 8px;
                 word-wrap: break-word;
+                line-height: 1.5;
             }
             .user { 
                 background-color: #e3f2fd;
-                margin-left: 20%;
+                margin-left: 15%;
                 text-align: right;
+                border-left: 4px solid #2196f3;
             }
             .assistant { 
-                background-color: #f5f5f5;
-                margin-right: 20%;
+                background-color: #f8f9fa;
+                margin-right: 15%;
+                border-left: 4px solid #28a745;
             }
             #input-container {
                 display: flex;
                 gap: 10px;
+                margin-top: 15px;
             }
             #user-input {
                 flex-grow: 1;
-                padding: 10px;
-                border: 1px solid #ccc;
-                border-radius: 5px;
+                padding: 12px;
+                border: 2px solid #ddd;
+                border-radius: 6px;
+                font-size: 14px;
+                transition: border-color 0.3s;
+            }
+            #user-input:focus {
+                border-color: #2196f3;
+                outline: none;
             }
             button {
-                padding: 10px 20px;
+                padding: 12px 24px;
                 background-color: #2196f3;
                 color: white;
                 border: none;
-                border-radius: 5px;
+                border-radius: 6px;
                 cursor: pointer;
+                font-size: 14px;
+                transition: background-color 0.3s;
+            }
+            button:hover {
+                background-color: #1976d2;
             }
             button:disabled {
                 background-color: #ccc;
@@ -216,29 +296,51 @@ async def get_chat_interface():
                 background-color: #d32f2f;
             }
             .loading {
-                color: #999;
+                color: #666;
                 font-style: italic;
+                animation: pulse 1.5s infinite;
+            }
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
             }
             .stopped {
                 color: #666;
                 font-style: italic;
                 border-left: 4px solid #f44336;
             }
+            .error {
+                background-color: #ffebee;
+                border-left: 4px solid #f44336;
+                color: #c62828;
+            }
+            .stats {
+                font-size: 12px;
+                color: #666;
+                margin-top: 10px;
+                text-align: center;
+            }
         </style>
     </head>
     <body>
         <div id="chat-container">
-            <h1>DH-Kkatuli_v1.0</h1>
+            <h1>🤖 DH-Kkatuli_v1.0 (Enhanced)</h1>
+            <div class="stats">
+                <span>모델: EEVE-Korean-Instruct-10.8B | 최적화된 답변 생성</span>
+            </div>
             <div id="messages"></div>
             <div id="input-container">
-                <input type="text" id="user-input" placeholder="메시지를 입력하세요...">
-                <button id="send-btn" onclick="sendMessage()">전송</button>
-                <button id="stop-btn" onclick="stopGeneration()">중단</button>
+                <input type="text" id="user-input" placeholder="질문을 입력하세요... (Enter로 전송)">
+                <button id="send-btn" onclick="sendMessage()">💬 전송</button>
+                <button id="stop-btn" onclick="stopGeneration()">⏹️ 중단</button>
             </div>
         </div>
+
         <script>
             let currentController = null;
             let isGenerating = false;
+            let messageCount = 0;
 
             function addMessage(role, content, isLoading = false) {
                 const messagesDiv = document.getElementById('messages');
@@ -247,6 +349,7 @@ async def get_chat_interface():
                 messageDiv.textContent = content;
                 messagesDiv.appendChild(messageDiv);
                 messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                messageCount++;
                 return messageDiv;
             }
 
@@ -260,11 +363,11 @@ async def get_chat_interface():
                 userInput.disabled = generating;
 
                 if (generating) {
-                    stopBtn.style.display = 'block';
+                    stopBtn.style.display = 'inline-block';
                     sendBtn.style.display = 'none';
                 } else {
                     stopBtn.style.display = 'none';
-                    sendBtn.style.display = 'block';
+                    sendBtn.style.display = 'inline-block';
                 }
             }
 
@@ -275,7 +378,6 @@ async def get_chat_interface():
                 }
                 updateButtonStates(false);
 
-                // 현재 응답 메시지에 중단됨 표시 추가
                 const messages = document.querySelectorAll('.message.assistant');
                 if (messages.length > 0) {
                     const lastMessage = messages[messages.length - 1];
@@ -292,14 +394,13 @@ async def get_chat_interface():
 
                 if (!message || isGenerating) return;
 
-                // UI 업데이트
                 input.value = '';
                 updateButtonStates(true);
                 addMessage('user', message);
-                const loadingMsg = addMessage('assistant', '응답을 생성하고 있습니다...', true);
+                const loadingMsg = addMessage('assistant', '🤔 생각하는 중...', true);
 
-                // AbortController 생성
                 currentController = new AbortController();
+                const startTime = Date.now();
 
                 try {
                     const response = await fetch('/chat', {
@@ -312,14 +413,13 @@ async def get_chat_interface():
                     });
 
                     if (!response.ok) {
-                        throw new Error('서버 오류');
+                        throw new Error(`서버 오류: ${response.status}`);
                     }
 
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder();
                     let assistantResponse = '';
 
-                    // 로딩 메시지 제거
                     loadingMsg.remove();
                     const responseDiv = addMessage('assistant', '');
 
@@ -334,15 +434,20 @@ async def get_chat_interface():
                             for (const line of lines) {
                                 if (line.startsWith('data: ')) {
                                     const data = line.slice(6);
-                                    if (data === '[DONE]') break;
+                                    if (data === '[DONE]') {
+                                        const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+                                        console.log(`응답 완료 (${duration}초)`);
+                                        break;
+                                    }
 
                                     try {
                                         const parsed = JSON.parse(data);
                                         if (parsed.text) {
                                             assistantResponse += parsed.text;
                                             responseDiv.textContent = assistantResponse;
+                                            responseDiv.scrollIntoView({ behavior: 'smooth', block: 'end' });
                                         } else if (parsed.error) {
-                                            responseDiv.textContent = parsed.error;
+                                            responseDiv.textContent = `❌ ${parsed.error}`;
                                             responseDiv.className += ' error';
                                             break;
                                         }
@@ -361,20 +466,21 @@ async def get_chat_interface():
                     }
 
                     if (!assistantResponse.trim() && !responseDiv.classList.contains('stopped')) {
-                        responseDiv.textContent = '응답을 받지 못했습니다.';
+                        responseDiv.textContent = '❌ 응답을 받지 못했습니다.';
+                        responseDiv.className += ' error';
                     }
 
                 } catch (error) {
                     if (error.name === 'AbortError') {
                         console.log('요청이 사용자에 의해 중단됨');
                         if (loadingMsg.parentNode) {
-                            loadingMsg.textContent = '요청이 중단되었습니다.';
+                            loadingMsg.textContent = '⏹️ 요청이 중단되었습니다.';
                             loadingMsg.className = 'message assistant stopped';
                         }
                     } else {
                         console.error('오류:', error);
                         if (loadingMsg.parentNode) {
-                            loadingMsg.textContent = '오류가 발생했습니다. 다시 시도해주세요.';
+                            loadingMsg.textContent = `❌ 오류: ${error.message}`;
                             loadingMsg.className = 'message assistant error';
                         }
                     }
@@ -384,6 +490,7 @@ async def get_chat_interface():
                 }
             }
 
+            // 엔터 키 이벤트
             document.getElementById('user-input').addEventListener('keypress', function(e) {
                 if (e.key === 'Enter' && !e.shiftKey && !isGenerating) {
                     e.preventDefault();
@@ -391,12 +498,15 @@ async def get_chat_interface():
                 }
             });
 
-            // 페이지 언로드 시 진행 중인 요청 중단
+            // 페이지 언로드 시 정리
             window.addEventListener('beforeunload', function() {
                 if (currentController) {
                     currentController.abort();
                 }
             });
+
+            // 초기 포커스
+            document.getElementById('user-input').focus();
         </script>
     </body>
     </html>
